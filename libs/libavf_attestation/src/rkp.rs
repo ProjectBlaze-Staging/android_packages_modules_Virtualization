@@ -1,0 +1,271 @@
+// Copyright 2023, The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! This module contains functions related to the attestation of the
+//! service VM via the RKP (Remote Key Provisioning) server.
+
+use crate::keyblob::EncryptedKeyBlob;
+use crate::ops::AttestationOps;
+use crate::pub_key::{build_maced_public_key, validate_public_key};
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use bssl_crypto::{ec::P256, ecdsa};
+use ciborium::{
+    cbor,
+    value::{CanonicalValue, Value},
+};
+use core::result;
+use coset::{iana, AsCborValue, CoseKeyBuilder};
+use log::{debug, error};
+use service_vm_comm::{EcdsaP256KeyPair, GenerateCertificateRequestParams, RequestProcessingError};
+use zeroize::Zeroizing;
+
+type Result<T> = result::Result<T, RequestProcessingError>;
+
+/// The salt is generated randomly with:
+/// hexdump -vn32 -e'16/1 "0x%02X, " 1 "\n"' /dev/urandom
+const HMAC_KEY_SALT: [u8; 32] = [
+    0x82, 0x80, 0xFA, 0xD3, 0xA8, 0x0A, 0x9A, 0x4B, 0xF7, 0xA5, 0x7D, 0x7B, 0xE9, 0xC3, 0xAB, 0x13,
+    0x89, 0xDC, 0x7B, 0x46, 0xEE, 0x71, 0x22, 0xB4, 0x5F, 0x4C, 0x3F, 0xE2, 0x40, 0x04, 0x3B, 0x6C,
+];
+const HMAC_KEY_INFO: &[u8] = b"rialto hmac wkey";
+const HMAC_KEY_LENGTH: usize = 32;
+
+/// Generates a new ECDSA P-256 key pair that can be attested by the remote server.
+pub fn generate_ecdsa_p256_key_pair(ops: &impl AttestationOps) -> Result<EcdsaP256KeyPair> {
+    let hmac_key = derive_hmac_key(ops)?;
+
+    let ec_key = ecdsa::PrivateKey::<P256>::generate();
+    let sec1 = ec_key.to_x962_uncompressed();
+    let cose_public_key = CoseKeyBuilder::new_ec2_pub_key_sec1_octet_string(
+        iana::EllipticCurve::P_256,
+        sec1.as_ref(),
+    )?
+    .algorithm(iana::Algorithm::ES256)
+    .build();
+
+    let maced_public_key = build_maced_public_key(cose_public_key, hmac_key.as_ref())?;
+    let key_blob = EncryptedKeyBlob::new(ec_key.to_der_ec_private_key().as_ref(), ops)?;
+
+    let key_pair =
+        EcdsaP256KeyPair { maced_public_key, key_blob: cbor_util::serialize(&key_blob)? };
+    Ok(key_pair)
+}
+
+const CSR_PAYLOAD_SCHEMA_V3: u8 = 3;
+const AUTH_REQ_SCHEMA_V1: u8 = 1;
+const CERTIFICATE_TYPE: &str = "rkp-vm";
+
+/// Builds the CSR described in:
+///
+/// hardware/interfaces/security/rkp/aidl/android/hardware/security/keymint/
+/// generateCertificateRequestV2.cddl
+pub fn generate_certificate_request(
+    params: GenerateCertificateRequestParams,
+    ops: &impl AttestationOps,
+) -> Result<Vec<u8>> {
+    let hmac_key = derive_hmac_key(ops)?;
+    let mut public_keys: Vec<Value> = Vec::new();
+    for key_to_sign in params.keys_to_sign {
+        let public_key = validate_public_key(&key_to_sign, hmac_key.as_ref())?;
+        public_keys.push(public_key.to_cbor_value()?);
+    }
+    debug!("Successfully validated all '{}' public keys.", public_keys.len());
+
+    // Builds `CsrPayload`.
+    let csr_payload = cbor!([
+        Value::Integer(CSR_PAYLOAD_SCHEMA_V3.into()),
+        Value::Text(String::from(CERTIFICATE_TYPE)),
+        device_info(),
+        Value::Array(public_keys),
+    ])?;
+    let csr_payload = cbor_util::serialize(&csr_payload)?;
+
+    // Builds `SignedData`.
+    let signed_data_payload =
+        cbor!([Value::Bytes(params.challenge.to_vec()), Value::Bytes(csr_payload)])?;
+    let payload_bytes = cbor_util::serialize(&signed_data_payload)?;
+    let signed_data = ops.sign_with_cdi_leaf(&payload_bytes)?.to_cbor_value()?;
+    debug!("Successfully signed the CSR payload.");
+
+    // Builds `AuthenticatedRequest<CsrPayload>`.
+    let uds_certs_bytes = match &params.uds_certs {
+        Some(certs) if !certs.is_empty() => certs,
+        _ => &ops.uds_certs()?,
+    };
+    let uds_certs: Value = cbor_util::deserialize(uds_certs_bytes)?;
+    validate_uds_certs(&uds_certs)?;
+    let dice_cert_chain: Value = cbor_util::deserialize(ops.reference_vm_dice_chain()?)?;
+    let auth_req = cbor!([
+        Value::Integer(AUTH_REQ_SCHEMA_V1.into()),
+        uds_certs,
+        dice_cert_chain,
+        signed_data,
+    ])?;
+    debug!("Successfully built the CBOR authenticated request.");
+    Ok(cbor_util::serialize(&auth_req)?)
+}
+
+/// Generates the device info required by the RKP server as a temporary placeholder.
+/// More details in b/301592917.
+///
+/// The keys of the map should be in the length-first core deterministic encoding order
+/// as per RFC8949.
+fn device_info() -> CanonicalValue {
+    cbor!({
+        "brand" => "aosp-avf",
+        "fused" => 1,
+        "model" => "avf",
+        "device" => "avf",
+        "product" => "avf",
+        "vb_state" => "avf",
+        "manufacturer" => "aosp-avf",
+        "vbmeta_digest" => Value::Bytes(vec![1u8; 1]),
+        "security_level" => "avf",
+        "boot_patch_level" => 20240202,
+        "bootloader_state" => "avf",
+        "system_patch_level" => 202402,
+        "vendor_patch_level" => 20240202,
+    })
+    .unwrap()
+    .into()
+}
+
+fn derive_hmac_key(ops: &impl AttestationOps) -> Result<Zeroizing<[u8; HMAC_KEY_LENGTH]>> {
+    ops.derive_kek(&HMAC_KEY_SALT, HMAC_KEY_INFO).map_err(|e| {
+        error!("Failed to compute the HMAC key: {e}");
+        RequestProcessingError::InternalError
+    })
+}
+
+/// Validate UdsCerts format against CDDL: { * SignerName => UdsCertChain }
+fn validate_uds_certs(uds_certs: &Value) -> Result<()> {
+    let map = uds_certs.as_map().ok_or_else(|| {
+        error!("UdsCerts is not a map");
+        RequestProcessingError::InvalidUdsCerts
+    })?;
+    for (signer_name, certs) in map {
+        let signer_name = signer_name.as_text().ok_or_else(|| {
+            error!("SignerName in UdsCerts is not a string");
+            RequestProcessingError::InvalidUdsCerts
+        })?;
+        let chain = certs.as_array().ok_or_else(|| {
+            error!("Signer '{}': UdsCertChain is not an array", signer_name);
+            RequestProcessingError::InvalidUdsCerts
+        })?;
+        if chain.is_empty() {
+            error!("Signer '{}': UdsCertChain is empty", signer_name);
+            return Err(RequestProcessingError::InvalidUdsCerts);
+        }
+        for (index, cert) in chain.iter().enumerate() {
+            if cert.as_bytes().is_none() {
+                error!(
+                    "Signer '{}', index {}: Certificate is not a byte array",
+                    signer_name, index
+                );
+                return Err(RequestProcessingError::InvalidUdsCerts);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The keys of device info map should be in the length-first core deterministic encoding
+    /// order as per RFC8949.
+    /// The CBOR ordering rules are:
+    /// 1. If two keys have different lengths, the shorter one sorts earlier;
+    /// 2. If two keys have the same length, the one with the lower value in (bytewise) lexical
+    ///    order sorts earlier.
+    #[test]
+    fn device_info_is_in_length_first_deterministic_order() {
+        let device_info = cbor!(device_info()).unwrap();
+        let device_info_map = device_info.as_map().unwrap();
+        let device_info_keys: Vec<&str> =
+            device_info_map.iter().map(|k| k.0.as_text().unwrap()).collect();
+        let mut sorted_keys = device_info_keys.clone();
+        sorted_keys.sort_by(|a, b| a.len().cmp(&b.len()).then(a.cmp(b)));
+        assert_eq!(device_info_keys, sorted_keys);
+    }
+
+    #[test]
+    fn validate_uds_certs_succeeds_with_valid_certs() {
+        let valid_cbor = cbor!({
+            "signer1" => [
+                Value::Bytes(b"cert1".to_vec()),
+                Value::Bytes(b"cert2".to_vec())
+            ],
+            "signer2" => [
+                Value::Bytes(b"cert3".to_vec())
+            ],
+        })
+        .unwrap();
+        assert!(validate_uds_certs(&valid_cbor).is_ok());
+    }
+
+    #[test]
+    fn validate_uds_certs_succeeds_with_empty_map() {
+        let empty_map = cbor!({}).unwrap();
+        assert!(validate_uds_certs(&empty_map).is_ok());
+    }
+
+    #[test]
+    fn validate_uds_certs_fails_with_non_map_value() {
+        let not_map = cbor!([]).unwrap();
+        assert_eq!(
+            validate_uds_certs(&not_map).unwrap_err(),
+            RequestProcessingError::InvalidUdsCerts
+        );
+    }
+
+    #[test]
+    fn validate_uds_certs_fails_with_non_string_signer_name() {
+        let key_not_string = cbor!({ 1 => [Value::Bytes(b"cert1".to_vec())] }).unwrap();
+        assert_eq!(
+            validate_uds_certs(&key_not_string).unwrap_err(),
+            RequestProcessingError::InvalidUdsCerts
+        );
+    }
+
+    #[test]
+    fn validate_uds_certs_fails_with_non_array_uds_cert_chain() {
+        let val_not_array = cbor!({ "signer1" => Value::Bytes(b"cert1".to_vec()) }).unwrap();
+        assert_eq!(
+            validate_uds_certs(&val_not_array).unwrap_err(),
+            RequestProcessingError::InvalidUdsCerts
+        );
+    }
+
+    #[test]
+    fn validate_uds_certs_fails_with_empty_uds_cert_chain() {
+        let empty_chain = cbor!({ "signer1" => [] }).unwrap();
+        assert_eq!(
+            validate_uds_certs(&empty_chain).unwrap_err(),
+            RequestProcessingError::InvalidUdsCerts
+        );
+    }
+
+    #[test]
+    fn validate_uds_certs_fails_with_non_byte_array_certificate() {
+        let cert_not_bytes = cbor!({ "signer1" => ["not_bytes"] }).unwrap();
+        assert_eq!(
+            validate_uds_certs(&cert_not_bytes).unwrap_err(),
+            RequestProcessingError::InvalidUdsCerts
+        );
+    }
+}

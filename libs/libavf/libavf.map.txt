@@ -1,0 +1,32 @@
+LIBAVF {
+  global:
+    AVirtualMachineRawConfig_create; # apex llndk
+    AVirtualMachineRawConfig_destroy; # apex llndk
+    AVirtualMachineRawConfig_setName; # apex llndk
+    AVirtualMachineRawConfig_setInstanceId; # apex llndk
+    AVirtualMachineRawConfig_setKernel; # apex llndk
+    AVirtualMachineRawConfig_setInitRd; # apex llndk
+    AVirtualMachineRawConfig_addDisk; # apex llndk
+    AVirtualMachineRawConfig_setMemoryMiB; # apex llndk
+    AVirtualMachineRawConfig_setSwiotlbMiB; # apex llndk
+    AVirtualMachineRawConfig_setVCpuCount; # apex llndk
+    AVirtualMachineRawConfig_setProtectedVm; # apex llndk
+    AVirtualMachineRawConfig_setHypervisorSpecificAuthMethod; # apex llndk
+    AVirtualMachineRawConfig_addCustomMemoryBackingFile; # apex llndk
+    AVirtualMachineRawConfig_setDeviceTreeOverlay; # apex llndk
+    AVirtualMachineRawConfig_addTeeService; # apex llndk introduced=37
+    AVirtualizationService_create; # apex llndk
+    AVirtualizationService_destroy; # apex llndk
+    AVirtualMachine_createRaw; # apex llndk
+    AVirtualMachine_start; # apex llndk
+    AVirtualMachine_startWithStopCallback; # apex llndk introduced=37
+    AVirtualMachine_stop; # apex llndk
+    AVirtualMachine_addAccessor; # apex llndk introduced=37
+    AVirtualMachine_connectVsock; # apex llndk
+    AVirtualMachine_waitForStop; # apex llndk
+    AVirtualMachine_destroy; # apex llndk
+    AVirtualMachine_addMemoryMapping; # apex llndk introduced=37
+    AVirtualMachine_removeMemoryMapping; #apex llndk introduced=37
+  local:
+    *;
+};

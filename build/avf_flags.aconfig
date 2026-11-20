@@ -1,0 +1,64 @@
+package: "com.android.system.virtualmachine.flags"
+container: "com.android.virt"
+
+flag {
+  name: "promote_set_should_use_hugepages_to_system_api"
+  is_exported: true
+  namespace: "virtualization"
+  description: "Flag used in @FlaggedApi annotation for setShouldUseHugepages"
+  bug: "383347947"
+  is_fixed_read_only: true
+}
+
+flag {
+  name: "terminal_gui_support"
+  is_exported: true
+  namespace: "virtualization"
+  description: "Flag for GUI support in terminal"
+  bug: "386296118"
+}
+
+flag {
+  name: "terminal_vm_communication_refactoring"
+  namespace: "virtualization"
+  description: "Flag for refactoring communication with vm to vsock"
+  bug: "458589051"
+}
+
+flag {
+  name: "terminal_storage_balloon"
+  is_exported: true
+  namespace: "virtualization"
+  description: "Flag for storage ballooning support in terminal"
+  bug: "382174138"
+}
+
+flag {
+  name: "virtualmachineexception_code"
+  is_exported: true
+  namespace: "virtualization"
+  description: "Flag used in @FlaggedApi annotation for VirtualMachineException.CODE_*"
+  bug: "438324609"
+}
+
+flag {
+  name: "microdroid_updatable_vm_attestation_support"
+  is_exported: true
+  namespace: "virtualization"
+  description: "Flag used to allow apps to check if Updatable VM or Remote Attestation is supported by AVF on the device"
+  bug: "458669008"
+}
+
+flag {
+  name: "microdroid_pvm_gic_its"
+  namespace: "virtualization"
+  description: "Flag used to allow microdroid pVMs to use vGIC ITS"
+  bug: "401031659"
+}
+
+flag {
+  name: "terminal_newui_jetpack"
+  namespace: "virtualization"
+  description: "Flag used to guard the new implementation of the terminal app using jetpack compose"
+  bug: "448356313"
+}

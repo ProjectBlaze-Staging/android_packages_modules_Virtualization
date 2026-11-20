@@ -1,0 +1,41 @@
+#!/bin/bash
+
+set -ex
+
+SCRIPT_PATH=$(readlink -f -- "${0}")
+SCRIPT_DIR=$(dirname -- ${SCRIPT_PATH});
+
+LOCALDEBS="${SCRIPT_DIR}/localdebs"
+LOCALFILES="${SCRIPT_DIR}/root_files"
+
+install_localdebs() {
+	if [ -d "$LOCALDEBS" ]; then
+		find "$LOCALDEBS" -name "*.deb" -print0 | xargs -0 -r dpkg -i
+	fi
+}
+
+_copy_files() {
+	cp -vR "${LOCALFILES}"/* /
+}
+
+_restart_services() {
+	CONFIG_CHANGED_SERVICES=(
+		attach-cidata.service
+		backup_mount.service
+		mnt-shared.automount
+		ttyd_uds.service
+		ttyd_vsock_bridge.path
+		linux_vm_manager.service
+	)
+	systemctl enable --now "${CONFIG_CHANGED_SERVICES[@]}"
+}
+
+apply_avf_configs() {
+	_copy_files
+	chown -R droid:users /home/droid
+	_restart_services
+}
+
+install_localdebs
+apply_avf_configs
+sync

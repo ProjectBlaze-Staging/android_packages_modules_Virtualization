@@ -1,0 +1,28 @@
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+// Note: Do not add `static_executable: true`. Otherwise SIGSEGV will happen
+//       when calling binder API.
+rust_binary_host {
+    name: "linux_vm_manager",
+    crate_name: "linux_vm_manager",
+    srcs: ["src/main.rs"],
+    edition: "2021",
+    prefer_rlib: true,
+    rustlibs: [
+        "android.system.virtualmachineservice_non_microdroid-rust",
+        "android.system.virtualizationcommon_non_microdroid-rust",
+        "debian_aidl_interface-rust",
+        "libanyhow",
+        "libbinder_rs",
+        "libenv_logger",
+        "libforwarder_guest_launcher",
+        "liblog_rust",
+        "librpcbinder_rs",
+        "libshutdown_runner",
+        "libstorage_balloon_agent",
+        "libtokio",
+        "libvsock",
+    ],
+}

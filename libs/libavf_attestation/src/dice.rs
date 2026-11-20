@@ -1,0 +1,666 @@
+// Copyright 2023, The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! This module contains functions related to DICE.
+
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use bssl_crypto::{
+    ec::{P256, P384},
+    ecdsa, ed25519,
+};
+use cbor_util::{
+    cbor_value_type, get_label_value, get_label_value_as_bytes, value_to_array, value_to_bytes,
+    value_to_map, value_to_num, value_to_text,
+};
+use ciborium::value::Value;
+use core::cell::OnceCell;
+use coset::{
+    self,
+    iana::{self, EnumI64},
+    Algorithm, AsCborValue, CborSerializable, CoseError, CoseKey, CoseSign1, KeyOperation, KeyType,
+    Label,
+};
+use diced_open_dice::DiceMode;
+use log::{debug, error, info};
+use service_vm_comm::{RequestProcessingError, Result};
+
+const CODE_HASH: i64 = -4670545;
+const CONFIG_DESC: i64 = -4670548;
+const AUTHORITY_HASH: i64 = -4670549;
+const MODE: i64 = -4670551;
+const SUBJECT_PUBLIC_KEY: i64 = -4670552;
+
+const CONFIG_DESC_COMPONENT_NAME: i64 = -70002;
+const CONFIG_DESC_SECURITY_VERSION: i64 = -70005;
+const CONFIG_DESC_PAYLOAD_DESCRIPTORS: i64 = -71002;
+const CONFIG_DESC_TENANT_DESCRIPTORS: i64 = -71004;
+
+const SUB_COMPONENT_NAME: i64 = 1;
+const SUB_COMPONENT_VERSION: i64 = 2;
+const SUB_COMPONENT_CODE_HASH: i64 = 3;
+const SUB_COMPONENT_AUTHORITY_HASH: i64 = 4;
+
+const KERNEL_COMPONENT_NAME: &str = "vm_entry";
+const VENDOR_PARTITION_COMPONENT_NAME: &str = "Microdroid vendor";
+const MICRODROID_PAYLOAD_COMPONENT_NAME: &str = "Microdroid payload";
+
+/// Represents a partially decoded `DiceCertChain` from the client VM.
+/// The whole chain is defined as following:
+///
+/// DiceCertChain = [
+///     PubKeyEd25519 / PubKeyECDSA256 / PubKeyECDSA384,  ; UDS_Pub
+///     + DiceChainEntry,               ; First CDI_Certificate -> Last CDI_Certificate
+/// ]
+#[derive(Debug, Clone)]
+pub struct ClientVmDiceChain {
+    /// Contains only the payloads specific to the Client VM (excluding the common prefix).
+    ///
+    /// The structure is either:
+    /// - [Kernel, Payload] (Length: 2)
+    /// - [Kernel, Vendor Module, Payload] (Length: 3)
+    payloads: Vec<DiceChainEntryPayload>,
+}
+
+impl ClientVmDiceChain {
+    /// Validates the signatures of the entries in the `client_vm_dice_chain` as following:
+    ///
+    /// - The first entry of the `client_vm_dice_chain` must be signed with the root public key.
+    /// - After the first entry, each entry of the `client_vm_dice_chain` must be signed with the
+    ///   subject public key of the previous entry.
+    ///
+    /// Returns a partially decoded client VM's DICE chain if the verification succeeds.
+    pub(crate) fn validate_signatures_and_parse_dice_chain(
+        mut client_vm_dice_chain: Vec<Value>,
+        common_chain_prefix_len: usize,
+    ) -> Result<Self> {
+        // Calculate the length of the Client VM specific suffix.
+        let suffix_len =
+            client_vm_dice_chain.len().checked_sub(common_chain_prefix_len).ok_or_else(|| {
+                error!(
+                    "The client VM DICE chain must extend the common chain prefix by exactly \
+                     2 or 3 entries. Common chain prefix length: {common_chain_prefix_len}, \
+                     Client chain length: {}",
+                    client_vm_dice_chain.len()
+                );
+                RequestProcessingError::InvalidDiceChain
+            })?;
+        if !(2..=3).contains(&suffix_len) {
+            error!("Invalid DICE chain suffix length: {suffix_len}. Expected 2 or 3.");
+            return Err(RequestProcessingError::InvalidDiceChain);
+        }
+        let root_public_key =
+            CoseKey::from_cbor_value(client_vm_dice_chain.remove(0))?.try_into()?;
+
+        let mut payloads = Vec::with_capacity(suffix_len);
+        // Determine the index where the VM-specific suffix begins in the `client_vm_dice_chain`
+        // vector (which now excludes the root key).
+        let suffix_start_index = common_chain_prefix_len - 1;
+        let mut previous_public_key = root_public_key;
+        for (i, value) in client_vm_dice_chain.into_iter().enumerate() {
+            let payload = DiceChainEntryPayload::validate_cose_signature_and_extract_payload(
+                value,
+                &previous_public_key,
+            )
+            .inspect_err(|e| error!("Failed to verify VM DICE chain entry {i}: {e:?}"))?;
+            previous_public_key = payload.subject_public_key.clone();
+            if i >= suffix_start_index {
+                payloads.push(payload);
+            }
+        }
+        Self::build(payloads)
+    }
+
+    fn build(payloads: Vec<DiceChainEntryPayload>) -> Result<Self> {
+        let check_name = |payload: &DiceChainEntryPayload, expected: &str| -> Result<()> {
+            if payload.component_name() != Some(expected) {
+                error!(
+                    "DICE chain entry component expected to be named '{expected}'. \
+                        Got '{:?}'",
+                    payload.component_name()
+                );
+                return Err(RequestProcessingError::InvalidDiceChain);
+            }
+            Ok(())
+        };
+
+        match payloads.as_slice() {
+            [kernel, payload] => {
+                check_name(kernel, KERNEL_COMPONENT_NAME)?;
+                check_name(payload, MICRODROID_PAYLOAD_COMPONENT_NAME)?;
+            }
+            [kernel, vendor, payload] => {
+                check_name(kernel, KERNEL_COMPONENT_NAME)?;
+                check_name(vendor, VENDOR_PARTITION_COMPONENT_NAME)?;
+                check_name(payload, MICRODROID_PAYLOAD_COMPONENT_NAME)?;
+            }
+            _ => {
+                error!("Invalid Client VM DICE chain suffix with length {}", payloads.len());
+                return Err(RequestProcessingError::InvalidDiceChain);
+            }
+        }
+
+        debug!("All entries in the client VM DICE chain have correct component names");
+        Ok(Self { payloads })
+    }
+
+    /// Returns the DICE chain entry describing the VM kernel.
+    pub fn kernel(&self) -> &DiceChainEntryPayload {
+        &self.payloads[0]
+    }
+
+    /// Returns the DICE chain entry describing the vendor module, if present.
+    ///
+    /// This entry exists only if the client VM includes a vendor partition, indicated
+    /// by a chain suffix length of 3 (structure: `[Kernel, Vendor, Payload]`).
+    pub fn vendor_module(&self) -> Option<&DiceChainEntryPayload> {
+        if self.payloads.len() == 3 {
+            Some(&self.payloads[1])
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn microdroid_payload(&self) -> &DiceChainEntryPayload {
+        &self.payloads[self.payloads.len() - 1]
+    }
+
+    pub(crate) fn microdroid_payload_components(&self) -> Result<Vec<SubComponent>> {
+        self.microdroid_payload().config_descriptor.payload_sub_components()
+    }
+
+    pub(crate) fn microdroid_tenant_components(&self) -> Result<Vec<SubComponent>> {
+        self.microdroid_payload().config_descriptor.tenant_sub_components()
+    }
+
+    /// Returns true if all payloads in the DICE chain are in normal mode.
+    pub(crate) fn all_entries_are_secure(&self) -> bool {
+        self.payloads.iter().all(|p| p.mode == DiceMode::kDiceModeNormal)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PublicKey(CoseKey);
+
+impl TryFrom<CoseKey> for PublicKey {
+    type Error = RequestProcessingError;
+
+    fn try_from(key: CoseKey) -> Result<Self> {
+        // The public key must allow use for verification.
+        // Note that an empty key_ops set implicitly allows everything.
+        let key_ops = &key.key_ops;
+        if !key_ops.is_empty()
+            && !key_ops.contains(&KeyOperation::Assigned(iana::KeyOperation::Verify))
+        {
+            error!("Public key does not support verification - key_ops: {key_ops:?}");
+            return Err(RequestProcessingError::InvalidDiceChain);
+        }
+        Ok(Self(key))
+    }
+}
+
+impl PublicKey {
+    /// Verifies the signature of the provided message with the public key.
+    ///
+    /// This function supports the following key/algorithm types as specified in
+    /// hardware/interfaces/security/rkp/aidl/android/hardware/security/keymint/
+    /// generateCertificateRequestV2.cddl:
+    ///
+    /// PubKeyEd25519 / PubKeyECDSA256 / PubKeyECDSA384
+    ///
+    /// The signature should be in the format defined by COSE in RFC 9053 section 2 for the
+    /// specific algorithm.
+    pub(crate) fn verify(&self, signature: &[u8], message: &[u8]) -> Result<()> {
+        match &self.0.kty {
+            KeyType::Assigned(iana::KeyType::EC2) => {
+                let Some(Algorithm::Assigned(alg)) = self.0.alg else {
+                    error!("Invalid algorithm in COSE key {:?}", self.0.alg);
+                    return Err(RequestProcessingError::InvalidDiceChain);
+                };
+                let crv =
+                    get_label_value(&self.0, Label::Int(iana::Ec2KeyParameter::Crv.to_i64()))?;
+                let sec1 = self.0.to_sec1_octet_string()?;
+                if alg == iana::Algorithm::ES256
+                    && crv == &Value::from(iana::EllipticCurve::P_256.to_i64())
+                {
+                    ecdsa::PublicKey::<P256>::from_x962_uncompressed(&sec1)
+                        .ok_or(RequestProcessingError::InvalidDiceChain)?
+                        .verify_p1363(message, signature)
+                        .map_err(|_| {
+                            error!("P256 signature verification failed");
+                            RequestProcessingError::InvalidDiceChain
+                        })
+                } else if alg == iana::Algorithm::ES384
+                    && crv == &Value::from(iana::EllipticCurve::P_384.to_i64())
+                {
+                    ecdsa::PublicKey::<P384>::from_x962_uncompressed(&sec1)
+                        .ok_or(RequestProcessingError::InvalidDiceChain)?
+                        .verify_p1363(message, signature)
+                        .map_err(|_| {
+                            error!("P384 signature verification failed");
+                            RequestProcessingError::InvalidDiceChain
+                        })
+                } else {
+                    error!("Unsupported algorithm or curve in EC2 key: {alg:?} {crv:?}");
+                    Err(RequestProcessingError::InvalidDiceChain)
+                }
+            }
+            KeyType::Assigned(iana::KeyType::OKP) => {
+                let curve_type =
+                    get_label_value(&self.0, Label::Int(iana::OkpKeyParameter::Crv.to_i64()))?;
+                if curve_type != &Value::from(iana::EllipticCurve::Ed25519.to_i64()) {
+                    error!("Unsupported curve type in OKP COSE key: {curve_type:?}");
+                    return Err(RequestProcessingError::OperationUnimplemented);
+                }
+                let x = get_label_value_as_bytes(
+                    &self.0,
+                    Label::Int(iana::OkpKeyParameter::X.to_i64()),
+                )?;
+                let public_key = x.try_into().map_err(|_| {
+                    error!("Invalid ED25519 public key size: {}", x.len());
+                    RequestProcessingError::InvalidDiceChain
+                })?;
+                let signature = signature.try_into().map_err(|_| {
+                    error!("Invalid ED25519 signature size: {}", signature.len());
+                    RequestProcessingError::InvalidDiceChain
+                })?;
+                ed25519::PublicKey::from_bytes(public_key).verify(message, signature).map_err(
+                    |_| {
+                        error!("ED25519 signature verification failed");
+                        RequestProcessingError::InvalidDiceChain
+                    },
+                )
+            }
+            kty => {
+                error!("Unsupported key type in COSE key: {kty:?}");
+                Err(RequestProcessingError::OperationUnimplemented)
+            }
+        }
+    }
+}
+
+/// Represents a partially decoded `DiceChainEntryPayload`. The whole payload is defined in:
+///
+/// hardware/interfaces/security/rkp/aidl/android/hardware/security/keymint/
+/// generateCertificateRequestV2.cddl
+#[derive(Debug, Clone)]
+pub struct DiceChainEntryPayload {
+    pub(crate) subject_public_key: PublicKey,
+    mode: DiceMode,
+    /// Code Hash.
+    pub code_hash: Vec<u8>,
+    pub(crate) authority_hash: Vec<u8>,
+    config_descriptor: ConfigDescriptor,
+}
+
+impl DiceChainEntryPayload {
+    /// Validates the signature of the provided CBOR value with the provided public key and
+    /// extracts payload from the value.
+    fn validate_cose_signature_and_extract_payload(
+        value: Value,
+        authority_public_key: &PublicKey,
+    ) -> Result<Self> {
+        let cose_sign1 = CoseSign1::from_cbor_value(value.clone())?;
+        let aad = &[]; // AAD is not used in DICE chain entry.
+        cose_sign1.verify_signature(aad, |signature, message| {
+            authority_public_key.verify(signature, message)
+        })?;
+        Self::from_cbor_value_unchecked(value)
+    }
+
+    /// Parses a `DiceChainEntryPayload` from a CBOR `Value` without verifying the signature
+    /// against an authority public key.
+    pub(crate) fn from_cbor_value_unchecked(value: Value) -> Result<Self> {
+        let cose_sign1 = CoseSign1::from_cbor_value(value)?;
+        let payload = cose_sign1.payload.ok_or_else(|| {
+            error!("No payload found in the DICE chain entry");
+            RequestProcessingError::InvalidDiceChain
+        })?;
+        let entries = value_to_map(Value::from_slice(&payload)?, "DiceChainEntryPayload")?;
+        let mut builder = PayloadBuilder::default();
+        for (key, value) in entries.into_iter() {
+            let key: i64 = value_to_num(key, "DiceChainEntryPayload key")?;
+            match key {
+                SUBJECT_PUBLIC_KEY => {
+                    let subject_public_key = value_to_bytes(value, "subject_public_key")?;
+                    let subject_public_key =
+                        CoseKey::from_slice(&subject_public_key)?.try_into()?;
+                    builder.subject_public_key(subject_public_key)?;
+                }
+                MODE => builder.mode(to_mode(value)?)?,
+                CODE_HASH => {
+                    let code_hash = value_to_bytes(value, "DiceChainEntryPayload code_hash")?;
+                    builder.code_hash(code_hash)?;
+                }
+                AUTHORITY_HASH => {
+                    let authority_hash =
+                        value_to_bytes(value, "DiceChainEntryPayload authority_hash")?;
+                    builder.authority_hash(authority_hash)?;
+                }
+                CONFIG_DESC => {
+                    let config_descriptor = value_to_bytes(value, "config_descriptor")?;
+                    let config_descriptor = ConfigDescriptor::from_slice(&config_descriptor)?;
+                    builder.config_descriptor(config_descriptor)?;
+                }
+                _ => {}
+            }
+        }
+        builder.build()
+    }
+
+    /// Returns the component name from the configuration descriptor.
+    pub(crate) fn component_name(&self) -> Option<&str> {
+        self.config_descriptor.component_name.as_deref()
+    }
+
+    /// Returns the security version from the configuration descriptor.
+    pub(crate) fn security_version(&self) -> Option<u64> {
+        self.config_descriptor.security_version
+    }
+}
+/// Represents a partially decoded `ConfigurationDescriptor`.
+///
+/// The whole `ConfigurationDescriptor` is defined in:
+///
+/// hardware/interfaces/security/rkp/aidl/android/hardware/security/keymint/
+/// generateCertificateRequestV2.cddl
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConfigDescriptor {
+    component_name: Option<String>,
+    security_version: Option<u64>,
+    payload_descriptors: Option<Value>,
+    tenant_descriptors: Option<Value>,
+}
+
+impl ConfigDescriptor {
+    fn from_slice(data: &[u8]) -> Result<Self> {
+        let value = Value::from_slice(data);
+        let Ok(value) = value else {
+            // Some DICE implementations store a hash in the config descriptor. So we just
+            // skip anything that doesn't parse correctly.
+            info!("Ignoring malformed config descriptor");
+            return Ok(Default::default());
+        };
+        let entries = value_to_map(value, "ConfigDescriptor")?;
+        let mut builder = ConfigDescriptorBuilder::default();
+        for (key, value) in entries.into_iter() {
+            let key: i64 = value_to_num(key, "ConfigDescriptor key")?;
+            match key {
+                CONFIG_DESC_COMPONENT_NAME => {
+                    let name = value_to_text(value, "ConfigDescriptor component_name")?;
+                    builder.component_name(name)?;
+                }
+                CONFIG_DESC_SECURITY_VERSION => {
+                    let version: u64 = value_to_num(value, "ConfigDescriptor security_version")?;
+                    builder.security_version(version)?;
+                }
+                CONFIG_DESC_PAYLOAD_DESCRIPTORS => {
+                    // If this is the Microdroid payload node then these are the subcomponents. But
+                    // for any other node it could be anything - this isn't a reserved key. So defer
+                    // decoding until we know which node is which.
+                    builder.payload_sub_components(value)?
+                }
+                CONFIG_DESC_TENANT_DESCRIPTORS => builder.tenant_sub_components(value)?,
+                _ => {}
+            }
+        }
+        builder.build()
+    }
+
+    /// Attempt to decode any Microdroid sub-components that were present in this config descriptor.
+    fn payload_sub_components(&self) -> Result<Vec<SubComponent>> {
+        let Some(value) = &self.payload_descriptors else {
+            return Ok(vec![]);
+        };
+        let sub_components = value_to_array(value.clone(), "ConfigDescriptor payload_descriptors")?;
+        sub_components.into_iter().map(SubComponent::try_from).collect()
+    }
+
+    /// Attempt to decode any Microdroid tenant sub-components that were present in this config
+    /// descriptor.
+    fn tenant_sub_components(&self) -> Result<Vec<SubComponent>> {
+        let Some(value) = &self.tenant_descriptors else {
+            return Ok(vec![]);
+        };
+        let tenant_sub_components =
+            value_to_array(value.clone(), "ConfigDescriptor tenant_descriptors")?;
+        tenant_sub_components.into_iter().map(SubComponent::try_from).collect()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConfigDescriptorBuilder {
+    component_name: OnceCell<String>,
+    security_version: OnceCell<u64>,
+    payload_descriptors: OnceCell<Value>,
+    tenant_descriptors: OnceCell<Value>,
+}
+
+impl ConfigDescriptorBuilder {
+    fn component_name(&mut self, component_name: String) -> Result<()> {
+        set_once(&self.component_name, component_name, "ConfigDescriptor component_name")
+    }
+
+    fn security_version(&mut self, security_version: u64) -> Result<()> {
+        set_once(&self.security_version, security_version, "ConfigDescriptor security_version")
+    }
+
+    fn payload_sub_components(&mut self, payload_descriptors: Value) -> Result<()> {
+        set_once(
+            &self.payload_descriptors,
+            payload_descriptors,
+            "ConfigDescriptor payload_descriptors",
+        )
+    }
+
+    fn tenant_sub_components(&mut self, tenant_descriptors: Value) -> Result<()> {
+        set_once(
+            &self.tenant_descriptors,
+            tenant_descriptors,
+            "ConfigDescriptor tenant_descriptors",
+        )
+    }
+
+    fn build(mut self) -> Result<ConfigDescriptor> {
+        let component_name = self.component_name.take();
+        let security_version = self.security_version.take();
+        let payload_descriptors = self.payload_descriptors.take();
+        let tenant_descriptors = self.tenant_descriptors.take();
+        Ok(ConfigDescriptor {
+            component_name,
+            security_version,
+            payload_descriptors,
+            tenant_descriptors,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SubComponent {
+    pub(crate) name: String,
+    pub(crate) version: u64,
+    pub(crate) code_hash: Vec<u8>,
+    pub(crate) authority_hash: Vec<u8>,
+}
+
+impl TryFrom<Value> for SubComponent {
+    type Error = RequestProcessingError;
+
+    fn try_from(value: Value) -> Result<Self> {
+        let entries = value_to_map(value, "SubComponent")?;
+        let mut builder = SubComponentBuilder::default();
+        for (key, value) in entries.into_iter() {
+            let key: i64 = value_to_num(key, "SubComponent key")?;
+            match key {
+                SUB_COMPONENT_NAME => {
+                    builder.name(value_to_text(value, "SubComponent component_name")?)?
+                }
+                SUB_COMPONENT_VERSION => {
+                    builder.version(value_to_num(value, "SubComponent version")?)?
+                }
+                SUB_COMPONENT_CODE_HASH => {
+                    builder.code_hash(value_to_bytes(value, "SubComponent code_hash")?)?
+                }
+                SUB_COMPONENT_AUTHORITY_HASH => {
+                    builder.authority_hash(value_to_bytes(value, "SubComponent authority_hash")?)?
+                }
+                k => {
+                    error!("Unknown key in SubComponent: {k}");
+                    return Err(RequestProcessingError::InvalidDiceChain);
+                }
+            }
+        }
+        builder.build()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct SubComponentBuilder {
+    name: OnceCell<String>,
+    version: OnceCell<u64>,
+    code_hash: OnceCell<Vec<u8>>,
+    authority_hash: OnceCell<Vec<u8>>,
+}
+
+impl SubComponentBuilder {
+    fn name(&mut self, name: String) -> Result<()> {
+        set_once(&self.name, name, "SubComponent name")
+    }
+
+    fn version(&mut self, version: u64) -> Result<()> {
+        set_once(&self.version, version, "SubComponent version")
+    }
+
+    fn code_hash(&mut self, code_hash: Vec<u8>) -> Result<()> {
+        set_once(&self.code_hash, code_hash, "SubComponent code_hash")
+    }
+
+    fn authority_hash(&mut self, authority_hash: Vec<u8>) -> Result<()> {
+        set_once(&self.authority_hash, authority_hash, "SubComponent authority_hash")
+    }
+
+    fn build(mut self) -> Result<SubComponent> {
+        let name = take_value(&mut self.name, "SubComponent name")?;
+        let version = take_value(&mut self.version, "SubComponent version")?;
+        let code_hash = take_value(&mut self.code_hash, "SubComponent code_hash")?;
+        let authority_hash = take_value(&mut self.authority_hash, "SubComponent authority_hash")?;
+        Ok(SubComponent { name, version, code_hash, authority_hash })
+    }
+}
+
+fn to_mode(value: Value) -> Result<DiceMode> {
+    let mode = match value {
+        // Mode is supposed to be encoded as a 1-byte bstr, but some implementations instead
+        // encode it as an integer. Accept either. See b/273552826.
+        // If Mode is omitted, it should be treated as if it was NotConfigured, according to
+        // the Open Profile for DICE spec.
+        Value::Bytes(bytes) => {
+            if bytes.len() != 1 {
+                error!("Bytes array with invalid length for mode: {:?}", bytes.len());
+                return Err(RequestProcessingError::InvalidDiceChain);
+            }
+            bytes[0].into()
+        }
+        Value::Integer(i) => i,
+        v => return Err(CoseError::UnexpectedItem(cbor_value_type(&v), "bstr or int").into()),
+    };
+    let mode = match mode {
+        x if x == (DiceMode::kDiceModeNormal as i64).into() => DiceMode::kDiceModeNormal,
+        x if x == (DiceMode::kDiceModeDebug as i64).into() => DiceMode::kDiceModeDebug,
+        x if x == (DiceMode::kDiceModeMaintenance as i64).into() => DiceMode::kDiceModeMaintenance,
+        // If Mode is invalid, it should be treated as if it was NotConfigured, according to
+        // the Open Profile for DICE spec.
+        _ => DiceMode::kDiceModeNotInitialized,
+    };
+    Ok(mode)
+}
+
+#[derive(Default, Debug, Clone)]
+struct PayloadBuilder {
+    subject_public_key: OnceCell<PublicKey>,
+    mode: OnceCell<DiceMode>,
+    code_hash: OnceCell<Vec<u8>>,
+    authority_hash: OnceCell<Vec<u8>>,
+    config_descriptor: OnceCell<ConfigDescriptor>,
+}
+
+fn set_once<T>(field: &OnceCell<T>, value: T, field_name: &str) -> Result<()> {
+    field.set(value).map_err(|_| {
+        error!("Field '{field_name}' is duplicated in the Payload");
+        RequestProcessingError::InvalidDiceChain
+    })
+}
+
+fn take_value<T>(field: &mut OnceCell<T>, field_name: &str) -> Result<T> {
+    field.take().ok_or_else(|| {
+        error!("Field '{field_name}' is missing in the Payload");
+        RequestProcessingError::InvalidDiceChain
+    })
+}
+
+impl PayloadBuilder {
+    fn subject_public_key(&mut self, key: PublicKey) -> Result<()> {
+        set_once(&self.subject_public_key, key, "subject_public_key")
+    }
+
+    fn mode(&mut self, mode: DiceMode) -> Result<()> {
+        set_once(&self.mode, mode, "mode")
+    }
+
+    fn code_hash(&mut self, code_hash: Vec<u8>) -> Result<()> {
+        set_once(&self.code_hash, code_hash, "code_hash")
+    }
+
+    fn authority_hash(&mut self, authority_hash: Vec<u8>) -> Result<()> {
+        set_once(&self.authority_hash, authority_hash, "authority_hash")
+    }
+
+    fn config_descriptor(&mut self, config_descriptor: ConfigDescriptor) -> Result<()> {
+        set_once(&self.config_descriptor, config_descriptor, "config_descriptor")
+    }
+
+    fn build(mut self) -> Result<DiceChainEntryPayload> {
+        let subject_public_key = take_value(&mut self.subject_public_key, "subject_public_key")?;
+        // If Mode is omitted, it should be treated as if it was NotConfigured, according to
+        // the Open Profile for DICE spec.
+        let mode = self.mode.take().unwrap_or(DiceMode::kDiceModeNotInitialized);
+        let code_hash = take_value(&mut self.code_hash, "code_hash")?;
+        validate_hash_size(code_hash.len(), "code_hash")?;
+        let authority_hash = take_value(&mut self.authority_hash, "authority_hash")?;
+        validate_hash_size(authority_hash.len(), "authority_hash")?;
+        let config_descriptor = take_value(&mut self.config_descriptor, "config_descriptor")?;
+        Ok(DiceChainEntryPayload {
+            subject_public_key,
+            mode,
+            code_hash,
+            authority_hash,
+            config_descriptor,
+        })
+    }
+}
+
+fn validate_hash_size(len: usize, name: &str) -> Result<()> {
+    // According to the Android Profile for DICE specification, SHA-256, SHA-384, and SHA-512
+    // are all acceptable hash algorithms.
+    const ACCEPTABLE_HASH_SIZES: [usize; 3] = [32, 48, 64];
+    if ACCEPTABLE_HASH_SIZES.contains(&len) {
+        Ok(())
+    } else {
+        error!(
+            "Invalid hash size for {name}: {len}. Acceptable hash sizes are: {ACCEPTABLE_HASH_SIZES:?}"
+        );
+        Err(RequestProcessingError::InvalidDiceChain)
+    }
+}

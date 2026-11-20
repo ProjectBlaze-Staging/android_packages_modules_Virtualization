@@ -1,0 +1,93 @@
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+rust_defaults {
+    name: "libcomposd_c_common_defaults",
+    edition: "2021",
+    srcs: [
+        "lib.rs",
+    ],
+    prefer_rlib: true,
+    rustlibs: [
+        "libanyhow",
+        "libandroid_logger",
+        "liblog_rust",
+        "android.system.composd-rust",
+        "libbinder_rs",
+        "libcompos_bindgen",
+        "libcompos_manifest_proto",
+        "libfsverity_rs",
+        "libhex",
+        "liblibc",
+        "libnix",
+        "libparking_lot",
+        "libscopeguard",
+        "librustix",
+        "libprotobuf",
+        "libbssl_crypto",
+        "compos_aidl_interface-rust",
+        "libcompos_common",
+        "libcompos_wrappers",
+    ],
+}
+
+rust_ffi {
+    name: "libcom_android_compos_ffi_c",
+    crate_name: "com_android_compos_ffi_c",
+    defaults: ["libcomposd_c_common_defaults"],
+    export_include_dirs: ["include"],
+    version_script: "libcom_android_compos_ffi_c.map.txt",
+    stubs: {
+        symbol_file: "libcom_android_compos_ffi_c.map.txt",
+        versions: ["38"],
+    },
+    apex_available: [
+        "com.android.compos",
+        "com.android.art",
+        "com.android.art.debug",
+    ],
+}
+
+rust_bindgen {
+    name: "libcompos_bindgen",
+    crate_name: "compos_bindgen",
+    wrapper_src: "include/verified_dex2oat.h",
+    source_stem: "c_bindings",
+    bindgen_flags: [
+        "--verbose",
+        "--with-derive-partialeq",
+        "--with-derive-eq",
+    ],
+    apex_available: [
+        "com.android.compos",
+    ],
+}
+
+cc_library_static {
+    name: "libcom_android_compos_ffi_cpp_wrapper",
+    srcs: ["cpp_wrapper/src/verified_dex2oat_compilation_wrapper.cc"],
+    local_include_dirs: ["cpp_wrapper/include"],
+    export_include_dirs: ["cpp_wrapper/include"],
+    shared_libs: [
+        "libbase",
+        "libcom_android_compos_ffi_c",
+    ],
+    min_sdk_version: "31",
+    apex_available: [
+        "com.android.art",
+        "com.android.art.debug",
+    ],
+}
+
+rust_test {
+    name: "libcom_android_compos_ffi_c_test",
+    auto_gen_config: true,
+    defaults: ["libcomposd_c_common_defaults"],
+    rustlibs: [
+        "libmockall",
+        "libtempfile",
+        "libcompos_wrappers_with_mocks",
+    ],
+    flags: ["-A dead_code"],
+}

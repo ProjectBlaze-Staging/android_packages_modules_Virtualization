@@ -1,0 +1,37 @@
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+rust_library_rlib {
+    name: "libhypervisor_backends",
+    crate_name: "hypervisor_backends",
+    defaults: ["avf_build_flags_rust"],
+    edition: "2021",
+    prefer_rlib: true,
+    host_supported: false,
+    no_stdlibs: true,
+    srcs: ["src/lib.rs"],
+    enabled: false,
+    stdlibs: [
+        "libcompiler_builtins.rust_sysroot",
+        "libcore.rust_sysroot",
+    ],
+    target: {
+        android_arm64: {
+            rustlibs: [
+                "libonce_cell",
+                "libsmccc",
+                "libthiserror",
+                "libuuid",
+            ],
+            enabled: true,
+        },
+        android_x86_64: {
+            rustlibs: [
+                "libonce_cell",
+                "libthiserror",
+            ],
+            enabled: true,
+        },
+    },
+}

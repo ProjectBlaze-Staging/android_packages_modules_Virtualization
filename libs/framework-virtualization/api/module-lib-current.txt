@@ -1,0 +1,10 @@
+// Signature format: 6.0
+// - style=java
+package android.system.virtualmachine {
+
+  public class VirtualizationFrameworkInitializer {
+    method public static void registerServiceWrappers();
+  }
+
+}
+

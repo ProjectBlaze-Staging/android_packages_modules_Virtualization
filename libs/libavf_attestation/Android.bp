@@ -1,0 +1,46 @@
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+rust_defaults {
+    name: "libavf_attestation_nostd_defaults",
+    compile_multilib: "first",
+    crate_name: "avf_attestation",
+    defaults: ["avf_build_flags_rust"],
+    srcs: ["src/lib.rs"],
+    prefer_rlib: true,
+    no_stdlibs: true,
+    stdlibs: [
+        "libcore.rust_sysroot",
+    ],
+    no_std_rlibs: [
+        "libbssl_crypto",
+        "libcbor_util_nostd",
+        "libciborium_nostd",
+        "libcoset_nostd",
+        "libder_nostd",
+        "libdiced_open_dice_nostd",
+        "liblog_rust_nostd",
+        "libmicrodroid_kernel_hashes",
+        "libplatform_security_patch_timestamp",
+        "libserde_nostd",
+        "libservice_vm_comm_nostd",
+        "libspki_nostd",
+        "libx509_cert_nostd",
+        "libzeroize_nostd",
+    ],
+}
+
+rust_library_rlib {
+    name: "libavf_attestation_nostd",
+    defaults: ["libavf_attestation_nostd_defaults"],
+    apex_available: [
+        "com.android.virt",
+    ],
+}
+
+rust_test {
+    name: "libavf_attestation.test",
+    defaults: ["libavf_attestation_nostd_defaults"],
+    test_suites: ["general-tests"],
+}

@@ -1,0 +1,45 @@
+# Welcome to Android KVM!
+#
+# Bug component: 867125
+#
+# If you are not a member of the project, and you are not sure who the
+# appropriate reviewer is, please send review requests to one of those listed
+# below. They may provide general guidance, review simple changes, or redirect
+# you to someone who can. Typically, the best way to find the owner of a
+# specific file is to check git blame and/or recent review history to find
+# who is recently responsible for changes to the area.
+jiyong@google.com
+dvander@google.com
+willdeacon@google.com
+
+# Other owners
+aliceywang@google.com
+ascull@google.com
+basantwani@google.com
+fmayle@google.com
+inseob@google.com
+ioffe@google.com
+jaewan@google.com
+jakobvukalovic@google.com
+jeffv@google.com
+jooyung@google.com
+keirf@google.com
+ptosi@google.com
+qperret@google.com
+qwandor@google.com
+sachinparekh@google.com
+sebastianene@google.com
+seungjaeyoo@google.com
+shikhapanwar@google.com
+smostafa@google.com
+tabba@google.com
+vdonnefort@google.com
+victorhsieh@google.com
+
+# Test owners
+per-file {**/,}TEST_MAPPING=set noparent
+per-file {**/,}TEST_MAPPING=jiyong@google.com,jaewan@google.com,ioffe@google.com,smoreland@google.com
+
+# Ferrochrome
+per-file android/TerminalApp/**=jiyong@google.com,jeongik@google.com
+per-file build/debian/**=jiyong@google.com,jeongik@google.com

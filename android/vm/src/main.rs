@@ -1,0 +1,596 @@
+// Copyright 2021, The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Android VM control tool.
+
+mod create_idsig;
+mod create_partition;
+mod run;
+
+use android_system_virtualizationservice::aidl::android::system::virtualizationservice::{
+    CpuOptions::CpuTopology::CpuTopology, IVirtualizationService::IVirtualizationService,
+    PartitionType::PartitionType, VirtualMachineAppConfig::DebugLevel::DebugLevel,
+};
+use anyhow::{bail, Context, Error};
+use binder::ProcessState;
+use clap::{Args, Parser};
+use create_idsig::command_create_idsig;
+use create_partition::command_create_partition;
+use run::{command_run, command_run_app, command_run_microdroid};
+use serde::Serialize;
+use std::io::{self, IsTerminal};
+use std::num::NonZeroU16;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use vmclient::VirtualizationService;
+
+#[derive(Args, Default)]
+/// Collection of flags that are at VM level and therefore applicable to all subcommands
+pub struct CommonConfig {
+    /// Name of VM
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Run VM with vCPU topology matching that of the host. If unspecified, defaults to 1 vCPU.
+    #[arg(long, default_value = "one_cpu", value_parser = parse_cpu_topology)]
+    cpu_topology: CpuTopology,
+
+    /// Memory size (in MiB) of the VM. If unspecified, defaults to the value of `memory_mib`
+    /// in the VM config file.
+    #[arg(short, long)]
+    mem: Option<u32>,
+
+    /// Run VM in protected mode.
+    #[arg(short, long)]
+    protected: bool,
+
+    /// Ask the kernel for transparent huge-pages (THP). This is only a hint and
+    /// the kernel will allocate THP-backed memory only if globally enabled by
+    /// the system and if any can be found. See
+    /// https://docs.kernel.org/admin-guide/mm/transhuge.html
+    #[arg(short, long)]
+    hugepages: bool,
+
+    /// Run VM with network feature.
+    #[cfg(network)]
+    #[arg(short, long)]
+    network_supported: bool,
+
+    /// Boost uclamp to stablise results for benchmarks.
+    #[arg(short, long)]
+    boost_uclamp: bool,
+
+    /// Secure services this VM wants to access.
+    #[arg(long)]
+    tee_services: Vec<String>,
+
+    /// Host services this VM wants to access.
+    #[cfg(vm_to_host_services)]
+    #[arg(long)]
+    host_services: Vec<String>,
+}
+
+impl CommonConfig {
+    fn network_supported(&self) -> bool {
+        cfg_if::cfg_if! {
+            if #[cfg(network)] {
+                self.network_supported
+            } else {
+                false
+            }
+        }
+    }
+}
+
+#[derive(Args, Default)]
+/// Collection of flags for debugging
+pub struct DebugConfig {
+    /// Debug level of the VM. Supported values: "full" (default), and "none".
+    #[arg(long, default_value = "full", value_parser = parse_debug_level)]
+    debug: DebugLevel,
+
+    /// Path to file for VM console output.
+    #[arg(long)]
+    console: Option<PathBuf>,
+
+    /// Path to file for VM console input.
+    #[arg(long)]
+    console_in: Option<PathBuf>,
+
+    /// Path to file for VM log output.
+    #[arg(long)]
+    log: Option<PathBuf>,
+
+    /// Port at which crosvm will start a gdb server to debug guest kernel.
+    /// Note: this is only supported on Android kernels android14-5.15 and higher.
+    #[arg(long)]
+    gdb: Option<NonZeroU16>,
+
+    /// Whether to enable earlycon. Only supported for debuggable Linux-based VMs.
+    #[cfg(debuggable_vms_improvements)]
+    #[arg(long)]
+    enable_earlycon: bool,
+
+    /// Path to file to dump VM device tree.
+    #[arg(long)]
+    dump_device_tree: Option<PathBuf>,
+
+    /// Enable crash kernel in VM
+    #[arg(short, long, default_value_t = true)]
+    ramdump: bool,
+}
+
+impl DebugConfig {
+    fn enable_earlycon(&self) -> bool {
+        cfg_if::cfg_if! {
+            if #[cfg(debuggable_vms_improvements)] {
+                self.enable_earlycon
+            } else {
+                false
+            }
+        }
+    }
+}
+
+#[derive(Args, Default)]
+/// Collection of flags that are Microdroid specific
+pub struct MicrodroidConfig {
+    /// Size of the storage. If not specified 10MB storage is allocated to the VM.
+    #[arg(long, value_parser=parse_size_into_bytes)]
+    storage_size: Option<u64>,
+
+    /// Path to disk image containing vendor-specific modules.
+    #[cfg(vendor_modules)]
+    #[arg(long)]
+    vendor: Option<PathBuf>,
+
+    /// SysFS nodes of devices to assign to VM
+    #[cfg(device_assignment)]
+    #[arg(long)]
+    devices: Vec<PathBuf>,
+
+    /// Version of OS to use. If not set, defaults to microdroid.
+    /// You can list all available OSes via `vm info` command.
+    #[arg(long)]
+    os: Option<String>,
+
+    /// Don't store pVM secrets in secretkeeper. This effectively means that after pVM shutdowns,
+    /// all data associated with can't be decrypted anymore. This option is mostly useful for early
+    /// test of pVMs during bring up on a new hardware, which might not have secretkeeper set up
+    /// correctly yet.
+    #[cfg(debuggable_vms_improvements)]
+    #[arg(long)]
+    ephemeral: bool,
+}
+
+impl MicrodroidConfig {
+    fn vendor(&self) -> Option<&PathBuf> {
+        cfg_if::cfg_if! {
+            if #[cfg(vendor_modules)] {
+                self.vendor.as_ref()
+            } else {
+                None
+            }
+        }
+    }
+
+    fn devices(&self) -> &[PathBuf] {
+        cfg_if::cfg_if! {
+            if #[cfg(device_assignment)] {
+                &self.devices
+            } else {
+                &[]
+            }
+        }
+    }
+
+    fn ephemeral(&self) -> bool {
+        cfg_if::cfg_if! {
+            if #[cfg(debuggable_vms_improvements)] {
+                self.ephemeral
+            } else {
+                false
+            }
+        }
+    }
+}
+
+#[derive(Args, Default)]
+/// Flags for the run_app subcommand
+pub struct RunAppConfig {
+    #[command(flatten)]
+    common: CommonConfig,
+
+    #[command(flatten)]
+    debug: DebugConfig,
+
+    #[command(flatten)]
+    microdroid: MicrodroidConfig,
+
+    /// Path to VM Payload APK
+    apk: PathBuf,
+
+    /// Path to idsig of the APK
+    idsig: PathBuf,
+
+    /// Path to the instance image. Created if not exists.
+    instance: PathBuf,
+
+    /// Path to file containing instance_id. Required iff llpvm feature is enabled.
+    #[arg(long = "instance-id-file")]
+    instance_id: PathBuf,
+
+    /// Path to the file backing the storage.
+    /// Created if the option is used but the path does not exist in the device.
+    #[arg(long)]
+    storage: Option<PathBuf>,
+
+    /// Path to VM config JSON within APK (e.g. assets/vm_config.json)
+    #[arg(long)]
+    config_path: Option<String>,
+
+    /// Name of VM payload binary within APK (e.g. MicrodroidTestNativeLib.so)
+    #[arg(long)]
+    #[arg(alias = "payload_path")]
+    payload_binary_name: Option<String>,
+
+    /// Paths to extra apk files.
+    #[arg(long = "extra-apk")]
+    #[clap(conflicts_with = "config_path")]
+    extra_apks: Vec<PathBuf>,
+
+    /// Paths to extra idsig files.
+    #[arg(long = "extra-idsig")]
+    extra_idsigs: Vec<PathBuf>,
+}
+
+impl RunAppConfig {
+    fn set_instance_id(&mut self, instance_id_file: PathBuf) {
+        self.instance_id = instance_id_file;
+    }
+}
+
+#[derive(Args, Default)]
+/// Flags for the run_microdroid subcommand
+pub struct RunMicrodroidConfig {
+    #[command(flatten)]
+    common: CommonConfig,
+
+    #[command(flatten)]
+    debug: DebugConfig,
+
+    #[command(flatten)]
+    microdroid: MicrodroidConfig,
+
+    /// Path to the directory where VM-related files (e.g. instance.img, apk.idsig, etc.) will
+    /// be stored. If not specified a random directory under /data/local/tmp/microdroid will be
+    /// created and used.
+    #[arg(long)]
+    work_dir: Option<PathBuf>,
+}
+
+#[derive(Args, Default)]
+/// Flags for the run subcommand
+pub struct RunCustomVmConfig {
+    #[command(flatten)]
+    common: CommonConfig,
+
+    #[command(flatten)]
+    debug: DebugConfig,
+
+    /// Path to VM config JSON
+    config: PathBuf,
+}
+
+#[derive(Parser)]
+enum Opt {
+    /// Check if the feature is enabled on device.
+    CheckFeatureEnabled { feature: String },
+    /// Run a virtual machine with a config in APK
+    RunApp {
+        #[command(flatten)]
+        config: RunAppConfig,
+    },
+    /// Run a virtual machine with Microdroid inside
+    RunMicrodroid {
+        #[command(flatten)]
+        config: RunMicrodroidConfig,
+    },
+    /// Run a virtual machine
+    Run {
+        #[command(flatten)]
+        config: RunCustomVmConfig,
+    },
+    /// List running virtual machines
+    List,
+    /// Print information about virtual machine support
+    Info,
+    /// Create a new empty partition to be used as a writable partition for a VM
+    CreatePartition {
+        /// Path at which to create the image file
+        path: PathBuf,
+
+        /// The desired size of the partition, in bytes.
+        size: u64,
+
+        /// Type of the partition
+        #[arg(short = 't', long = "type", default_value = "raw",
+               value_parser = parse_partition_type)]
+        partition_type: PartitionType,
+    },
+    /// Creates or update the idsig file by digesting the input APK file.
+    CreateIdsig {
+        /// Path to VM Payload APK
+        apk: PathBuf,
+
+        /// Path to idsig of the APK
+        path: PathBuf,
+    },
+    /// Connect to the serial console of a VM
+    Console {
+        /// CID of the VM
+        cid: Option<i32>,
+    },
+    /// Sends a command to the VM to start adbd.
+    StartAdbd {
+        /// CID of the VM
+        #[arg(long)]
+        cid: i32,
+    },
+    /// Sends a command to the VM to stop adbd.
+    StopAdbd {
+        /// CID of the VM
+        #[arg(long)]
+        cid: i32,
+    },
+}
+
+fn parse_debug_level(s: &str) -> Result<DebugLevel, String> {
+    match s {
+        "none" => Ok(DebugLevel::NONE),
+        "full" => Ok(DebugLevel::FULL),
+        _ => Err(format!("Invalid debug level {s}")),
+    }
+}
+
+fn parse_partition_type(s: &str) -> Result<PartitionType, String> {
+    match s {
+        "raw" => Ok(PartitionType::RAW),
+        "instance" => Ok(PartitionType::ANDROID_VM_INSTANCE),
+        _ => Err(format!("Invalid partition type {s}")),
+    }
+}
+
+fn parse_cpu_topology(s: &str) -> Result<CpuTopology, String> {
+    match s {
+        "one_cpu" => Ok(CpuTopology::CpuCount(1)),
+        "match_host" => Ok(CpuTopology::MatchHost(true)),
+        _ if s.starts_with("cpu_count=") => {
+            // Safe to unwrap as it's validated the string starts with cpu_count=
+            let val = s.strip_prefix("cpu_count=").unwrap();
+            Ok(CpuTopology::CpuCount(val.parse().map_err(|e| format!("Invalid CPU Count: {e}"))?))
+        }
+        _ => Err(format!("Invalid cpu topology {s}")),
+    }
+}
+
+fn parse_size_into_bytes(s: &str) -> Result<u64, String> {
+    if let Some(val) = s.to_lowercase().strip_suffix("gb") {
+        u64::from_str(val).map(|v| v * 1024 * 1024 * 1024)
+    } else if let Some(val) = s.to_lowercase().strip_suffix("mb") {
+        u64::from_str(val).map(|v| v * 1024 * 1024)
+    } else if let Some(val) = s.to_lowercase().strip_suffix("kb") {
+        u64::from_str(val).map(|v| v * 1024)
+    } else if let Some(val) = s.to_lowercase().strip_suffix("b") {
+        u64::from_str(val)
+    } else {
+        u64::from_str(s)
+    }
+    .map_err(|e| format!("Invalid size: {e}"))
+}
+
+fn command_check_feature_enabled(feature: &str) {
+    println!(
+        "Feature {feature} is {}",
+        if avf_features::is_feature_enabled(feature) { "enabled" } else { "disabled" }
+    );
+}
+
+fn main() -> Result<(), Error> {
+    env_logger::init();
+    let opt = Opt::parse();
+
+    // We need to start the thread pool for Binder to work properly, especially link_to_death.
+    ProcessState::start_thread_pool();
+
+    let virtmgr = VirtualizationService::new().context("Failed to spawn VirtualizationService")?;
+    let binding = virtmgr.connect().context("Failed to connect to VirtualizationService")?;
+    let service = binding.as_ref();
+
+    match opt {
+        Opt::CheckFeatureEnabled { feature } => {
+            command_check_feature_enabled(&feature);
+            Ok(())
+        }
+        Opt::RunApp { config } => command_run_app(service, config),
+        Opt::RunMicrodroid { config } => command_run_microdroid(service, config),
+        Opt::Run { config } => command_run(service, config),
+        Opt::List => command_list(service),
+        Opt::Info => command_info(service),
+        Opt::CreatePartition { path, size, partition_type } => {
+            command_create_partition(service, &path, size, partition_type)
+        }
+        Opt::CreateIdsig { apk, path } => command_create_idsig(service, &apk, &path),
+        Opt::Console { cid } => command_console(service, cid),
+        Opt::StartAdbd { cid } => command_start_or_stop_adbd(service, cid, true),
+        Opt::StopAdbd { cid } => command_start_or_stop_adbd(service, cid, false),
+    }
+}
+
+/// List the VMs currently running.
+fn command_list(service: &dyn IVirtualizationService) -> Result<(), Error> {
+    let vms = service.debugListVms().context("Failed to get list of VMs")?;
+    println!("Running VMs: {vms:#?}");
+    Ok(())
+}
+
+/// Print information about supported VM types.
+fn command_info(service: &dyn IVirtualizationService) -> Result<(), Error> {
+    let non_protected_vm_supported = hypervisor_props::is_vm_supported()?;
+    let protected_vm_supported = hypervisor_props::is_protected_vm_supported()?;
+    match (non_protected_vm_supported, protected_vm_supported) {
+        (false, false) => println!("VMs are not supported."),
+        (false, true) => println!("Only protected VMs are supported."),
+        (true, false) => println!("Only non-protected VMs are supported."),
+        (true, true) => println!("Both protected and non-protected VMs are supported."),
+    }
+
+    if let Some(version) = hypervisor_props::version()? {
+        println!("Hypervisor version: {version}");
+    } else {
+        println!("Hypervisor version not set.");
+    }
+
+    if Path::new("/dev/kvm").exists() {
+        println!("/dev/kvm exists.");
+    } else {
+        println!("/dev/kvm does not exist.");
+    }
+
+    if Path::new("/dev/vfio/vfio").exists() {
+        println!("/dev/vfio/vfio exists.");
+    } else {
+        println!("/dev/vfio/vfio does not exist.");
+    }
+
+    if Path::new("/sys/bus/platform/drivers/vfio-platform").exists() {
+        println!("VFIO-platform is supported.");
+    } else {
+        println!("VFIO-platform is not supported.");
+    }
+
+    #[derive(Serialize)]
+    struct AssignableDevice {
+        node: String,
+        dtbo_label: String,
+    }
+
+    let devices = service.getAssignableDevices()?;
+    let devices: Vec<_> = devices
+        .into_iter()
+        .map(|device| AssignableDevice { node: device.node, dtbo_label: device.dtbo_label })
+        .collect();
+    println!("Assignable devices: {}", serde_json::to_string(&devices)?);
+
+    let os_list = service.getSupportedOSList()?;
+    println!("Available OS list: {}", serde_json::to_string(&os_list)?);
+
+    let debug_policy = service.getDebugPolicy()?;
+    println!("Debug policy: {debug_policy}");
+
+    // If strings are changed, also change tests.
+    if service.isUpdatableVmSupported()? {
+        println!("Updatable VM is supported.");
+    } else {
+        println!("Updatable VM is not supported.");
+    }
+
+    Ok(())
+}
+
+fn command_console(service: &dyn IVirtualizationService, cid: Option<i32>) -> Result<(), Error> {
+    if !io::stdin().is_terminal() {
+        bail!("Stdin must be a terminal (tty). Use 'adb shell -t' to force allocate tty.");
+    }
+    let mut vms = service.debugListVms().context("Failed to get list of VMs")?;
+    if let Some(cid) = cid {
+        vms.retain(|vm_info| vm_info.cid == cid);
+    }
+    let host_console_name = vms
+        .into_iter()
+        .find_map(|vm_info| vm_info.hostConsoleName)
+        .context("Failed to get VM with console")?;
+
+    // TODO(b/429049948): Uncomment below after resetting foreground process.
+    // Err(Command::new("microcom").arg(host_console_name).exec().into())
+    println!("Use `microcom {host_console_name}` to connect to console");
+    Ok(())
+}
+
+fn command_start_or_stop_adbd(
+    service: &dyn IVirtualizationService,
+    cid: i32,
+    start: bool,
+) -> Result<(), Error> {
+    service.startOrStopAdbd(cid, start)?;
+    if start {
+        println!("started adbd for VM with CID {cid}");
+    } else {
+        println!("stopped adbd for VM with CID {cid}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn verify_app() {
+        // Check that the command parsing has been configured in a valid way.
+        Opt::command().debug_assert();
+    }
+
+    #[test]
+    fn test_parse_size_into_bytes() {
+        let val = parse_size_into_bytes("3MB").unwrap();
+        assert_eq!(val, 3 * 1024 * 1024);
+        let val = parse_size_into_bytes("3Mb").unwrap();
+        assert_eq!(val, 3 * 1024 * 1024);
+        let val = parse_size_into_bytes("3mb").unwrap();
+        assert_eq!(val, 3 * 1024 * 1024);
+
+        let val = parse_size_into_bytes("2GB").unwrap();
+        assert_eq!(val, 2 * 1024 * 1024 * 1024);
+        let val = parse_size_into_bytes("2Gb").unwrap();
+        assert_eq!(val, 2 * 1024 * 1024 * 1024);
+        let val = parse_size_into_bytes("2gb").unwrap();
+        assert_eq!(val, 2 * 1024 * 1024 * 1024);
+
+        let val = parse_size_into_bytes("5KB").unwrap();
+        assert_eq!(val, 5 * 1024);
+        let val = parse_size_into_bytes("5Kb").unwrap();
+        assert_eq!(val, 5 * 1024);
+        let val = parse_size_into_bytes("5kb").unwrap();
+        assert_eq!(val, 5 * 1024);
+
+        let val = parse_size_into_bytes("23B").unwrap();
+        assert_eq!(val, 23);
+        let val = parse_size_into_bytes("23b").unwrap();
+        assert_eq!(val, 23);
+
+        let val = parse_size_into_bytes("23").unwrap();
+        assert_eq!(val, 23);
+
+        let val = parse_size_into_bytes("i-am-not-a-number");
+        assert!(val.is_err());
+
+        let val = parse_size_into_bytes("23NaN5Gb");
+        assert!(val.is_err());
+
+        let val = parse_size_into_bytes(r"¯\_(ツ)_/¯");
+        assert!(val.is_err());
+    }
+}

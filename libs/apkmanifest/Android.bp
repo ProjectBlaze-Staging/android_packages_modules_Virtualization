@@ -1,0 +1,102 @@
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+cc_library_shared {
+    name: "libapkmanifest_native",
+    defaults: ["avf_build_flags_cc"],
+    srcs: ["native/*.cpp"],
+    shared_libs: [
+        "libandroidfw",
+        "libbase",
+        "liblog",
+        "libutils",
+    ],
+}
+
+rust_bindgen {
+    name: "libapkmanifest_bindgen",
+    defaults: ["avf_build_flags_rust"],
+    edition: "2021",
+    wrapper_src: "native/apkmanifest.hpp",
+    crate_name: "apkmanifest_bindgen",
+    source_stem: "bindings",
+    bindgen_flags: [
+        "--default-enum-style rust",
+    ],
+}
+
+rust_defaults {
+    name: "libapkmanifest_defaults",
+    crate_name: "apkmanifest",
+    defaults: ["avf_build_flags_rust"],
+    edition: "2021",
+    srcs: ["src/apkmanifest.rs"],
+    rustlibs: [
+        "libanyhow",
+        "libapkzip",
+        "libapkmanifest_bindgen",
+        "libscopeguard",
+    ],
+    shared_libs: ["libapkmanifest_native"],
+    multilib: {
+        lib32: {
+            enabled: false,
+        },
+    },
+}
+
+rust_library {
+    name: "libapkmanifest",
+    defaults: ["libapkmanifest_defaults"],
+}
+
+rust_test {
+    name: "libapkmanifest.test",
+    defaults: ["libapkmanifest_defaults"],
+    test_suites: ["device-tests"],
+    data: [
+        ":libapkmanifest_test_apks.basic",
+        ":libapkmanifest_test_apks.enc_store_mode",
+        ":libapkmanifest_test_apks.relaxed_rollback",
+        ":libapkmanifest_test_apks.full",
+        ":libapkmanifest_test_apks.only_rollback_index",
+        ":libapkmanifest_test_apks.only_relaxed_rollback_permission",
+    ],
+    ld_flags: [
+        "-Wl,--rpath,\\$$ORIGIN",
+    ],
+    data_libs: [
+        "libapkmanifest_native",
+    ],
+}
+
+android_test_helper_app {
+    name: "libapkmanifest_test_apks.basic",
+    manifest: "testdata/AndroidManifest_basic.xml",
+}
+
+android_test_helper_app {
+    name: "libapkmanifest_test_apks.enc_store_mode",
+    manifest: "testdata/AndroidManifest_enc_store_mode.xml",
+}
+
+android_test_helper_app {
+    name: "libapkmanifest_test_apks.relaxed_rollback",
+    manifest: "testdata/AndroidManifest_relaxed_rollback.xml",
+}
+
+android_test_helper_app {
+    name: "libapkmanifest_test_apks.full",
+    manifest: "testdata/AndroidManifest_full.xml",
+}
+
+android_test_helper_app {
+    name: "libapkmanifest_test_apks.only_rollback_index",
+    manifest: "testdata/AndroidManifest_only_rollback_index.xml",
+}
+
+android_test_helper_app {
+    name: "libapkmanifest_test_apks.only_relaxed_rollback_permission",
+    manifest: "testdata/AndroidManifest_only_relaxed_rollback_permission.xml",
+}

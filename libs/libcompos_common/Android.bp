@@ -1,0 +1,64 @@
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+rust_defaults {
+    name: "libcompos_common_defaults",
+    defaults: ["avf_build_flags_rust"],
+    srcs: ["lib.rs"],
+    edition: "2021",
+    rustlibs: [
+        "android.system.virtualizationservice-rust",
+        "compos_aidl_interface-rust",
+        "libanyhow",
+        "libbinder_rs",
+        "libglob",
+        "liblog_rust",
+        "libhw_timeout_multiplier",
+        "libnum_traits",
+        "librustutils",
+        "libminijail_rust",
+        "libvmclient",
+        "libplatformproperties_rust",
+    ],
+    proc_macros: ["libnum_derive"],
+}
+
+rust_library {
+    name: "libcompos_common",
+    crate_name: "compos_common",
+    defaults: ["libcompos_common_defaults"],
+    apex_available: [
+        "com.android.compos",
+    ],
+}
+
+rust_library {
+    name: "libcompos_common_with_mocks",
+    crate_name: "compos_common_with_mocks",
+    defaults: ["libcompos_common_defaults"],
+    cfgs: ["test"],
+    rustlibs: ["libmockall"],
+}
+
+rust_protobuf {
+    name: "libcompos_manifest_proto",
+    crate_name: "compos_manifest_proto",
+    protos: ["proto/manifest.proto"],
+    source_stem: "compos_manifest",
+    apex_available: [
+        "com.android.compos",
+    ],
+}
+
+cc_library_static {
+    name: "libcompos_manifest_proto_cc",
+    srcs: ["proto/manifest.proto"],
+    proto: {
+        export_proto_headers: true,
+        type: "full",
+    },
+    apex_available: [
+        "com.android.compos",
+    ],
+}
